@@ -208,22 +208,23 @@ void ImprovedKernelMatMul(int m, int n, int k,  float* d_A, float* d_B, float* d
     float Cvalue = 0;
 
     // Outer loop over the A and B tils required to compute the C element
-    for (int t = 0; t < n / TILE_WIDTH; ++t) {
+    for (int t = 0; t < (n-1) / TILE_WIDTH + 1; ++t) {
         // Collaborative loading into the shared memory
-        ds_A[ty][tx] = d_A[Row * n + t * TILE_WIDTH + tx]; // [Row][t * TILE_WIDTH + tx];
-        ds_B[ty][tx] = d_A[(TILE_WIDTH * t + ty) * k + Col]; // [Row][t * TILE_WIDTH + tx];
+        // Add checks for non-even sizes
+        ds_A[ty][tx] = ((Row < m) && (t * TILE_WIDTH + tx < n)) ? d_A[Row * n + t * TILE_WIDTH + tx] : 0; // [Row][t * TILE_WIDTH + tx];
+        ds_B[ty][tx] = ((TILE_WIDTH * t + ty < n) && (Col < k)) ? d_A[(TILE_WIDTH * t + ty) * k + Col] : 0; // [Row][t * TILE_WIDTH + tx];
         __syncthreads();
 
         // Do actual computations
         for (int i = 0; i < TILE_WIDTH; ++i) {
             Cvalue += ds_A[ty][i] * ds_B[i][tx];
-        }
+        } 
         __syncthreads(); // Signals that we can overwrite the shared mamory 
                             //(Otherwise some fast thread might start the loop again and overwrite somethign)
-
     }
 
-    d_C[Row * k + Col] = Cvalue;
+    if ((Row < m) && (Col < k)) 
+        d_C[Row * k + Col] = Cvalue;
 }
 
 void cuda_KernelMatMul(float* h_A, float* h_B, int m , int n, int k) {
@@ -248,3 +249,193 @@ void exapmleKernel() {
     __device__ int GlobalVar; // global memory, grid scope, application lifetime.
     __device__ __constant__ int ConstVar; // constant, grid scope and applicaiotn lifetime.
 }
+
+
+void runner() {
+    // Way pf querying the device parameters.
+    int dev_count;
+    cudaGetDeviceCount(&dev_count);
+    cudaDeviceProp dev_prop;
+    for (int i = 0; i < dev_count ; i++) {
+        cudaGetDeviceProperties(&dev_prop, i);
+        // dev_prop.maxThreadsPerBlock;
+        // dev_prop.sharedMemoryPerBlock;
+    }
+}
+
+
+// Week 3
+
+// DRAM -- dynamically random access memory design.
+// Memory coalescing
+// good access pattern: A[(independednt of thread index) + thread index]
+
+// Convolution
+
+// 1D
+
+__global__ void convolution_1D(float* N, float * M, float * P, int mask_width, int width) {
+    // Really, it's correlation
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    float Pvalue;
+
+    int N_start_point = i - mask_width /2 ;
+    for (int j = 0 ; j < mask_width; j++) {
+        if (N_start_point + j >= 0 && N_start_point + j < width) {
+    int N_start_point = i - mask_width /2 ;
+            Pvalue += N[N_start_point + j] * M[j];
+        }
+    }
+    P[i] = Pvalue;
+}
+
+__global__ void convolution_1D_tiled(float* N, float * M, float * P, int mask_width, int width) {
+    // Really, it's correlation
+    // Input tile is all the elements that are needed to compute output tiles
+    const int O_TILE_WIDTH = 2;
+    __shared__ float Ns[O_TILE_WIDTH];
+    
+    int index_o = blockIdx.x * blockDim.x + threadIdx.x;
+    int index_i = index_o - mask_width /2;
+    int tx = threadIdx.x;
+
+    float output = 0.0;
+
+    if ((index_i >= 0) && (index_i < width)) {
+        Ns[tx] = N[index_i];
+    } else {
+        Ns[tx] = 0.0;
+    }
+    __syncthreads();
+
+    if (threadIdx.x < O_TILE_WIDTH) { // only do if this thread actualy runs something
+        output = 0.0;
+        for (int j = 0; j < mask_width; ++j) { // j is the index in the mask
+            output += M[j] * Ns[j + threadIdx.x]; // in the input array we need to shift the index by the thread index
+                                                    //because we start relative to the ouput array 
+        }
+        P[index_o] = output;
+    }
+}
+
+#define MASK_WIDTH 5
+#define O_TILE_WIDTH 1020
+#define BLOCK_WIDTH (O_TILE_WIDTH + MASK_WIDTH - 1)
+// void conv_runner() {
+//     dim3 dimBlock(BLOCK_WIDTH, 1, 1);
+//     dim3 dimGrid((Width - 1) / O_TILE_WITH, 1, 1);
+    
+// }
+
+
+// For 2d we try to pad each row to the multiple if DRAM burst size.
+// For now, we'll work with a single channel image
+
+typedef struct {
+    int width;
+    int height;
+    int pitch;
+    int channels;
+    float* data;
+} * wbImage_t;
+
+void conv_runner_2d(wbImage_t img) {
+    dim3 dimBlock(BLOCK_WIDTH, BLOCK_WIDTH, 1);
+    dim3 dimGrid((img->width - 1) / O_TILE_WIDTH + 1, 
+        (img->height - 1) / O_TILE_WIDTH + 1, 1);
+}
+
+__global__ void conviolution_2D_kernel(float *P, float *N,
+                                        int height, int width, int channels,
+                                        const float** __restrict__ M) {
+    // CDUA devices provide constant memory whocse contents are aggressively cached.
+    // Cached values are broadcast to all threads in a wrap
+    // Effectively magnifies memory bandwith without consuming shared memory
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    // figure out where this thread will write the output
+    // of the convolution operation
+    int row_o = blockIdx.y * O_TILE_WIDTH + ty;
+    int col_o = blockIdx.x * O_TILE_WIDTH + tx;
+    // Figure out where the element written in to the shared mamory will be
+    int row_i = row_o - MASK_WIDTH;
+    int col_i = col_o - MASK_WIDTH;
+
+    // Loading the input element
+    __shared__ float Ns[BLOCK_WIDTH][BLOCK_WIDTH];
+    if ((row_i >= 0) && (row_i < height) && 
+        (col_i >= 0) && (col_i < height)) {
+        Ns[ty][tx] = N[row_i * width + col_i]; // can also use pitch instead of width if needed; 
+    } else {
+        Ns[ty][tx] = 0.0;
+    }
+    __syncthreads();
+
+    float output = 0.0;
+
+    if (ty < O_TILE_WIDTH && tx < O_TILE_WIDTH) {
+        for (int i = 0; i < MASK_WIDTH; i++)
+        for (int j = 0; j < MASK_WIDTH; j++) {
+            output += M[i][j] * Ns[i + ty][j + tx];
+        }
+    }
+
+    if (row_o < height && col_o < width)
+        P[row_o * width + col_o] = output;
+}
+
+
+// Week 4
+
+// Parallel reduction pattern
+// Work efficiency analysis 
+// Partition and summarize
+// something like MapReduce
+
+// Basic reduction kernel
+
+__global__ void reduction_kernel(float * input) {
+    __shared__ float partialSum[2 * BLOCK_WIDTH];
+
+    unsigned int t = threadIdx.x;
+    unsigned int start = 2 * blockIdx.x * blockDim.x;
+    partialSum[t] = input[start + t];
+    partialSum[t + blockDim.x] = input[start + t + blockDim.x];
+
+    for (unsigned int stride = 1; stride < blockDim.x; stride*=2) {
+        __syncthreads();
+        if (t % stride == 0) {
+            partialSum[2 * t] += partialSum[2 * t + stride];
+        }
+    }
+}
+
+// Better implementation keeping active threads consecutive and 
+// reducting the number of active wraps
+
+__global__ void better_reduction_kernel(float * input) {
+    __shared__ float partialSum[2 * BLOCK_WIDTH];
+
+    unsigned int t = threadIdx.x;
+    unsigned int start = 2 * blockIdx.x * blockDim.x;
+    partialSum[t] = input[start + t];
+    partialSum[t + blockDim.x] = input[start + t + blockDim.x];
+
+    for (unsigned int stride = blockDim.x; stride > 0; stride/=2) {
+        __syncthreads();
+        if (t < stride) {
+            partialSum[t] += partialSum[2 * t + stride];
+        } 
+        // else {
+        //     break;
+        // }
+    }
+}
+
+// Takeaway: always amake sure that the running threads are close to each other
+
+// prefix sum
+//http://developer.download.nvidia.com/compute/cuda/1_1/Website/projects/scan/doc/scan.pdf
+//https://developer.nvidia.com/gpugems/gpugems3/part-vi-gpu-computing/chapter-39-parallel-prefix-sum-scan-cuda
