@@ -439,3 +439,115 @@ __global__ void better_reduction_kernel(float * input) {
 // prefix sum
 //http://developer.download.nvidia.com/compute/cuda/1_1/Website/projects/scan/doc/scan.pdf
 //https://developer.nvidia.com/gpugems/gpugems3/part-vi-gpu-computing/chapter-39-parallel-prefix-sum-scan-cuda
+
+// Naive proposal is very bad
+// We can use a better parallel version:
+
+#define SECTION_SIZE 16
+__global__ void work_inefficient_scan_kernel(float *X, float *Y, int InputSize) {
+    __shared__ float XY[SECTION_SIZE];
+    int i = blockDim.x * blockIdx.x + threadIdx.x;
+    if (i < InputSize) {
+        XY[threadIdx.x] = X[i];
+    }
+
+    // Now we perform iteratice scan
+    for (unsigned int stride = 1; stride <= threadIdx.x; stride *=2) {
+        // Need to add a check on which threads are actually working,
+        // but this is actually taken care of by the for loop statement
+        __syncthreads();
+        float in1 = XY[threadIdx.x - stride];
+        __syncthreads();
+        XY[threadIdx.x] += in1;
+    }
+    __syncthreads();
+    if (i < InputSize) {
+        Y[i] = XY[threadIdx.x];
+    }
+    // This gives more operations than sequential algorithm, but in theory time can be just log n;
+}
+
+// we can also do work -efficient scan kernel.
+#define BLOCK_SIZE 16
+__global__ void efficient_scan_kernel(float *X, float *Y, int InputSize) {
+    __shared__ float XY[BLOCK_SIZE * 2];
+    int i = blockDim.x * blockIdx.x + threadIdx.x;
+    if (i < InputSize) {
+        XY[threadIdx.x] = X[i];
+    }
+
+    // Now we perform iteratice scan
+    for (unsigned int stride = 1; stride <= BLOCK_SIZE; stride *=2) {
+        // note that all the working threads are actually close to each other so they are likely falling in
+        // the same warp
+        int index = (threadIdx.x + 1) * stride * 2 - 1;
+        if (index < 2 * BLOCK_SIZE) {
+            XY[index] += XY[index - stride];
+        }
+        __syncthreads();
+        // we don't need the double syncthreads because each thread is looking ofr  aunique element which is not
+        // being altred by any other thread.
+    }
+    // Post reduction code:
+    for (unsigned int stride = BLOCK_SIZE/2; stride > 0; stride /=2) {
+        __syncthreads();
+        int index = (threadIdx.x + 1) * stride * 2 - 1;
+        if (index + stride < 2 * BLOCK_SIZE) {
+            XY[index + stride] += XY[index];
+        }
+        // we don't need the double syncthreads because each thread is looking ofr  aunique element which is not
+        // being altred by any other thread.
+    } 
+    __syncthreads();
+        if (i < InputSize) {
+        Y[i] = XY[threadIdx.x];
+    }
+}
+
+// Week 5 -- histogramming
+
+// atomic computations -- read, operate and write all in one go.
+
+__global__ void histo_kernel(unsigned char * buffer, long size, unsigned int *histo) {
+    int i = threadIdx.x + blockIdx.x + blockDim.x;
+    // Stride is the total number of threads taht can compute the histogram
+    int stride = gridDim.x + blockDim.x;
+
+    // All threads handle <stride> consecutive elemetns
+    while (i < size) {
+        atomicAdd(&(histo[buffer[i]]), 1);
+        i+=stride;
+    }
+}
+
+// Better version is possible:
+// privitazation technique!!!
+__global__ void histo_kernel_better(unsigned char * buffer, long size, unsigned int *histo) {
+    __shared__ unsigned int histo_private[256];
+
+    // Use first 256 threads to collaborate and initialize entries to 0; 
+    if (threadIdx.x < 256) {
+        histo_private[threadIdx.x] = 0;
+    }
+    __syncthreads(); 
+
+    int i = threadIdx.x + blockIdx.x + blockDim.x;
+    int stride = gridDim.x + blockDim.x;
+
+    while (i < size) {
+        atomicAdd(&(histo_private[buffer[i]]), 1);
+        i+=stride;
+    }
+
+    __syncthreads();
+
+    // put values back to global
+    if (threadIdx.x < 256) {
+        atomicAdd(&(histo[threadIdx.x]), histo_private[threadIdx.x]);
+    }
+
+    // That's how provatization works.
+}
+
+
+
